@@ -1,0 +1,106 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*", // Allows any frontend link (GitHub Pages/Netlify) to connect
+    methods: ["GET", "POST"]
+  }
+});
+
+// Store connected players by room
+const rooms = {};
+
+io.on('connection', (socket) => {
+  console.log('Player connected:', socket.id);
+
+  // 1. Join a specific world/room from the URL
+  socket.on('joinRoom', ({ roomId, playerName }) => {
+    socket.join(roomId);
+    socket.roomId = roomId;
+
+    if (!rooms[roomId]) rooms[roomId] = {};
+    
+    // Initialize player state
+    rooms[roomId][socket.id] = {
+      id: socket.id,
+      name: playerName || `Player_${socket.id.substring(0, 4)}`,
+      x: 0, y: 10, z: 0,
+      rotY: 0,
+      hp: 100
+    };
+
+    // Send current players in the room to the newly joined player
+    socket.emit('currentPlayers', rooms[roomId]);
+
+    // Tell everyone else in the room that a new player joined
+    socket.to(roomId).emit('playerJoined', rooms[roomId][socket.id]);
+  });
+
+  // 2. Sync Movement & Rotation
+  socket.on('playerMove', (data) => {
+    const room = rooms[socket.roomId];
+    if (room && room[socket.id]) {
+      room[socket.id].x = data.x;
+      room[socket.id].y = data.y;
+      room[socket.id].z = data.z;
+      room[socket.id].rotY = data.rotY;
+
+      // Broadcast movement to everyone else in the same room
+      socket.to(socket.roomId).emit('playerMoved', {
+        id: socket.id,
+        ...data
+      });
+    }
+  });
+
+  // 3. Relay Chat Messages
+  socket.on('chatMessage', (text) => {
+    const room = rooms[socket.roomId];
+    if (room && room[socket.id]) {
+      io.to(socket.roomId).emit('chatMessage', {
+        sender: room[socket.id].name,
+        text: text
+      });
+    }
+  });
+
+  // 4. Handle Player Hits / Combat
+  socket.on('hitPlayer', ({ targetId, damage }) => {
+    const room = rooms[socket.roomId];
+    if (room && room[targetId]) {
+      room[targetId].hp -= damage;
+      
+      // Broadcast health update / hit animation to everyone in the room
+      io.to(socket.roomId).emit('playerHit', {
+        targetId: targetId,
+        attackerId: socket.id,
+        newHp: room[targetId].hp
+      });
+
+      // Reset HP on death (respawn)
+      if (room[targetId].hp <= 0) {
+        room[targetId].hp = 100;
+        io.to(socket.roomId).emit('playerRespawn', { id: targetId });
+      }
+    }
+  });
+
+  // 5. Handle Disconnect
+  socket.on('disconnect', () => {
+    const room = rooms[socket.roomId];
+    if (room && room[socket.id]) {
+      delete room[socket.id];
+      socket.to(socket.roomId).emit('playerLeft', socket.id);
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
